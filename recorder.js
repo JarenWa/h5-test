@@ -5,18 +5,16 @@ class VideoRecorder {
     this.isRecording = false;
     this.startTime = 0;
     this.duration = 0;
-    this.chunks = []; // 本地缓存（上传失败时用）
+    this.chunks = [];
     this.uploadedChunks = 0;
     this.taskId = '';
     
-    // 从 URL 获取参数
     const params = new URLSearchParams(window.location.search);
     this.taskId = params.get('taskId') || this.generateTaskId();
     this.maxDuration = parseInt(params.get('duration')) || 600;
     this.userId = params.get('userId') || '';
     this.scriptId = params.get('scriptId') || '';
     
-    // 【修改】云函数地址（替换为实际地址）
     this.uploadUrl = 'https://fc-mp-c5a9b0e5-b19a-49dc-875f-0e541ef48fec.next.bspapp.com/videoUpload';
     
     this.init();
@@ -51,7 +49,7 @@ class VideoRecorder {
     const mimeType = this.getSupportedMimeType();
     if (!mimeType) { this.updateStatus('浏览器不支持录制'); return; }
 
-    const options = { mimeType, videoBitsPerSecond: 2500000, audioBitsPerSecond: 128000 };
+    const options = { mimeType, videoBitsPerSecond: 2500000, audioBitsPerRate: 128000 };
     try { this.mediaRecorder = new MediaRecorder(this.stream, options); }
     catch (err) { this.mediaRecorder = new MediaRecorder(this.stream); }
 
@@ -60,7 +58,6 @@ class VideoRecorder {
     this.isRecording = true;
     this.startTime = Date.now();
 
-    // 每秒输出一个片段
     this.mediaRecorder.start(1000);
 
     this.mediaRecorder.ondataavailable = async (e) => {
@@ -76,7 +73,6 @@ class VideoRecorder {
     this.updateStatus('录制中...');
     this.startTimer();
     
-    // 到达设定时长自动停止
     setTimeout(() => { if (this.isRecording) this.stop(); }, this.maxDuration * 1000);
     
     this.notifyMiniProgram('start', { taskId: this.taskId });
@@ -95,12 +91,14 @@ class VideoRecorder {
     return null;
   }
 
-  // 【修改】Base64 上传片段
+  // 【修复】使用 XMLHttpRequest + 安全的 Base64 编码
   async uploadChunk(blob) {
     try {
-      // Blob 转 Base64
+      // Blob 转 ArrayBuffer
       const arrayBuffer = await blob.arrayBuffer();
-      const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+      
+      // 【修复】安全的 Base64 编码（处理所有二进制数据）
+      const base64 = this.arrayBufferToBase64(arrayBuffer);
       
       const body = {
         action: 'upload',
@@ -113,13 +111,8 @@ class VideoRecorder {
         scriptId: this.scriptId
       };
 
-      const response = await fetch(this.uploadUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      
-      const result = await response.json();
+      // 【修复】使用 XMLHttpRequest 替代 fetch（WebView 兼容性更好）
+      const result = await this.xhrPost(this.uploadUrl, body);
       
       if (result.success) {
         this.uploadedChunks++;
@@ -129,15 +122,52 @@ class VideoRecorder {
       }
     } catch (err) {
       console.error('上传错误:', err);
-      // 缓存本地，稍后重试
       this.chunks.push({
         index: this.uploadedChunks,
         blob,
         timestamp: Date.now()
       });
       this.uploadedChunks++;
-      this.updateStatus('上传失败，已缓存');
+      this.updateStatus('上传失败，已缓存: ' + err.message);
     }
+  }
+
+  // 【新增】安全的 ArrayBuffer 转 Base64
+  arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  }
+
+  // 【新增】XMLHttpRequest POST（WebView 兼容）
+  xhrPost(url, data) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const result = JSON.parse(xhr.responseText);
+            resolve(result);
+          } catch (err) {
+            reject(new Error('解析响应失败: ' + xhr.responseText));
+          }
+        } else {
+          reject(new Error('HTTP ' + xhr.status + ': ' + xhr.statusText));
+        }
+      };
+      
+      xhr.onerror = () => reject(new Error('网络请求失败'));
+      xhr.ontimeout = () => reject(new Error('请求超时'));
+      
+      xhr.send(JSON.stringify(data));
+    });
   }
 
   stop() {
@@ -158,7 +188,7 @@ class VideoRecorder {
     for (const chunk of this.chunks) {
       try {
         const arrayBuffer = await chunk.blob.arrayBuffer();
-        const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+        const base64 = this.arrayBufferToBase64(arrayBuffer);
         
         const body = {
           action: 'upload',
@@ -172,11 +202,7 @@ class VideoRecorder {
           isRetry: true
         };
         
-        await fetch(this.uploadUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
+        await this.xhrPost(this.uploadUrl, body);
       } catch (err) {
         console.error('重试上传失败:', err);
       }
@@ -184,17 +210,12 @@ class VideoRecorder {
 
     // 触发合并
     try {
-      const mergeRes = await fetch(this.uploadUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'merge',
-          taskId: this.taskId,
-          totalChunks: this.uploadedChunks,
-          duration: this.duration
-        })
+      const mergeResult = await this.xhrPost(this.uploadUrl, {
+        action: 'merge',
+        taskId: this.taskId,
+        totalChunks: this.uploadedChunks,
+        duration: this.duration
       });
-      const mergeResult = await mergeRes.json();
       
       this.notifyMiniProgram('complete', {
         taskId: this.taskId,
