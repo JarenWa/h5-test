@@ -5,12 +5,9 @@ class VideoRecorder {
     this.isRecording = false;
     this.startTime = 0;
     this.duration = 0;
-    this.chunks = [];
+    this.chunks = []; // 本地缓存（上传失败时用）
     this.uploadedChunks = 0;
     this.taskId = '';
-    this.ws = null;
-    this.reconnectAttempts = 0;
-    this.maxReconnect = 3;
     
     // 从 URL 获取参数
     const params = new URLSearchParams(window.location.search);
@@ -19,7 +16,7 @@ class VideoRecorder {
     this.userId = params.get('userId') || '';
     this.scriptId = params.get('scriptId') || '';
     
-    // UniCloud 云函数地址（后续替换）
+    // 【修改】云函数地址（替换为实际地址）
     this.uploadUrl = 'https://fc-mp-c5a9b0e5-b19a-49dc-875f-0e541ef48fec.next.bspapp.com/videoUpload';
     
     this.init();
@@ -63,7 +60,7 @@ class VideoRecorder {
     this.isRecording = true;
     this.startTime = Date.now();
 
-    // 关键：每秒输出一个片段，实时上传
+    // 每秒输出一个片段
     this.mediaRecorder.start(1000);
 
     this.mediaRecorder.ondataavailable = async (e) => {
@@ -98,28 +95,46 @@ class VideoRecorder {
     return null;
   }
 
+  // 【修改】Base64 上传片段
   async uploadChunk(blob) {
-    const formData = new FormData();
-    formData.append('file', blob, `chunk_${this.uploadedChunks}.webm`);
-    formData.append('taskId', this.taskId);
-    formData.append('index', this.uploadedChunks);
-    formData.append('timestamp', Date.now());
-    formData.append('userId', this.userId);
-    formData.append('scriptId', this.scriptId);
-
     try {
+      // Blob 转 Base64
+      const arrayBuffer = await blob.arrayBuffer();
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+      
+      const body = {
+        action: 'upload',
+        taskId: this.taskId,
+        index: this.uploadedChunks,
+        timestamp: Date.now(),
+        fileData: base64,
+        fileName: `chunk_${this.uploadedChunks}.webm`,
+        userId: this.userId,
+        scriptId: this.scriptId
+      };
+
       const response = await fetch(this.uploadUrl, {
         method: 'POST',
-        body: formData
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
       });
+      
       const result = await response.json();
+      
       if (result.success) {
         this.uploadedChunks++;
         this.updateStatus(`已上传 ${this.uploadedChunks} 段`);
+      } else {
+        throw new Error(result.message || '上传失败');
       }
     } catch (err) {
-      // 失败则缓存本地，稍后重试
-      this.chunks.push({ index: this.uploadedChunks, blob, timestamp: Date.now() });
+      console.error('上传错误:', err);
+      // 缓存本地，稍后重试
+      this.chunks.push({
+        index: this.uploadedChunks,
+        blob,
+        timestamp: Date.now()
+      });
       this.uploadedChunks++;
       this.updateStatus('上传失败，已缓存');
     }
@@ -139,28 +154,41 @@ class VideoRecorder {
   async finalize() {
     this.duration = Date.now() - this.startTime;
     
-    // 上传缓存的片段（如有）
+    // 重试缓存的片段
     for (const chunk of this.chunks) {
-      const formData = new FormData();
-      formData.append('file', chunk.blob, `chunk_${chunk.index}.webm`);
-      formData.append('taskId', this.taskId);
-      formData.append('index', chunk.index);
-      formData.append('timestamp', chunk.timestamp);
-      formData.append('isRetry', 'true');
-      
       try {
-        await fetch(this.uploadUrl, { method: 'POST', body: formData });
+        const arrayBuffer = await chunk.blob.arrayBuffer();
+        const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+        
+        const body = {
+          action: 'upload',
+          taskId: this.taskId,
+          index: chunk.index,
+          timestamp: chunk.timestamp,
+          fileData: base64,
+          fileName: `chunk_${chunk.index}.webm`,
+          userId: this.userId,
+          scriptId: this.scriptId,
+          isRetry: true
+        };
+        
+        await fetch(this.uploadUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
       } catch (err) {
-        console.error('重试上传失败', err);
+        console.error('重试上传失败:', err);
       }
     }
 
-    // 通知服务端合并
+    // 触发合并
     try {
-      const mergeRes = await fetch(this.uploadUrl + '?action=merge', {
+      const mergeRes = await fetch(this.uploadUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          action: 'merge',
           taskId: this.taskId,
           totalChunks: this.uploadedChunks,
           duration: this.duration
@@ -168,11 +196,11 @@ class VideoRecorder {
       });
       const mergeResult = await mergeRes.json();
       
-      // 通知小程序
       this.notifyMiniProgram('complete', {
         taskId: this.taskId,
         duration: this.duration,
-        fileUrl: mergeResult.fileID || ''
+        fileUrl: mergeResult.fileID || '',
+        segments: mergeResult.segments || []
       });
     } catch (err) {
       this.notifyMiniProgram('error', { message: '合并失败: ' + err.message });
@@ -203,7 +231,6 @@ class VideoRecorder {
   notifyMiniProgram(action, data) {
     if (window.wx && wx.miniProgram) {
       wx.miniProgram.postMessage({ data: { action, ...data, timestamp: Date.now() } });
-      // 完成后自动返回小程序
       if (action === 'complete' || action === 'error') {
         setTimeout(() => wx.miniProgram.navigateBack(), 500);
       }
