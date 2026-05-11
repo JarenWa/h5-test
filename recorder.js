@@ -20,7 +20,7 @@ class VideoRecorder {
     this.scriptId = params.get('scriptId') || '';
     
     // UniCloud 云函数地址（后续替换）
-    this.uploadUrl = 'https://your-unicloud-function-url/videoUpload';
+    this.uploadUrl = 'https://fc-mp-c5a9b0e5-b19a-49dc-875f-0e541ef48fec.next.bspapp.com/videoUpload';
     
     this.init();
   }
