@@ -5,10 +5,13 @@ class VideoRecorder {
     this.isRecording = false;
     this.startTime = 0;
     this.duration = 0;
-    this.chunks = [];
-    this.uploadedChunks = 0;
+    this.failedChunks = [];      // 上传失败的片段缓存
+    this.uploadedChunks = 0;     // 成功上传的片段数
+    this.nextChunkIndex = 0;     // 下一个片段的序号（同步分配，避免并发冲突）
     this.taskId = '';
     this.isFinalizing = false;
+    this.isUploading = false;    // 是否正在上传（队列锁）
+    this.uploadQueue = [];       // 上传队列
 
     const params = new URLSearchParams(window.location.search);
     this.taskId = params.get('taskId') || this.generateTaskId();
@@ -67,19 +70,24 @@ class VideoRecorder {
     try { this.mediaRecorder = new MediaRecorder(this.stream, options); }
     catch (err) { this.mediaRecorder = new MediaRecorder(this.stream); }
 
-    this.chunks = [];
+    this.failedChunks = [];
     this.uploadedChunks = 0;
+    this.nextChunkIndex = 0;
     this.isRecording = true;
     this.isFinalizing = false;
+    this.isUploading = false;
+    this.uploadQueue = [];
     this.startTime = Date.now();
 
-    this.mediaRecorder.start(3000);
+    // ========== 关键修改：timeslice 从 3000ms 改为 5000ms，减少请求频率 ==========
+    this.mediaRecorder.start(5000);
 
-    this.mediaRecorder.ondataavailable = async (e) => {
+    // ondataavailable 中同步分配 index，避免并发冲突
+    this.mediaRecorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) {
-        this.uploadChunk(e.data).catch(err => {
-          console.error('上传片段异常:', err);
-        });
+        const index = this.nextChunkIndex++;
+        this.uploadQueue.push({ index, blob: e.data, timestamp: Date.now() });
+        this.processUploadQueue();
       }
     };
 
@@ -126,8 +134,24 @@ class VideoRecorder {
     return null;
   }
 
-  async uploadChunk(blob) {
-    const currentIndex = this.uploadedChunks;
+  // ========== 上传队列处理器（顺序上传，避免并发冲突） ==========
+  async processUploadQueue() {
+    if (this.isUploading || this.uploadQueue.length === 0) return;
+    this.isUploading = true;
+
+    while (this.uploadQueue.length > 0) {
+      const item = this.uploadQueue.shift();
+      await this.uploadChunk(item.index, item.blob, item.timestamp);
+    }
+
+    this.isUploading = false;
+    // 如果队列在此过程中又有新数据，继续处理
+    if (this.uploadQueue.length > 0) {
+      this.processUploadQueue();
+    }
+  }
+
+  async uploadChunk(index, blob, timestamp) {
     try {
       const arrayBuffer = await blob.arrayBuffer();
       const base64 = this.arrayBufferToBase64(arrayBuffer);
@@ -135,10 +159,10 @@ class VideoRecorder {
       const body = {
         action: 'upload',
         taskId: this.taskId,
-        index: currentIndex,
-        timestamp: Date.now(),
+        index: index,
+        timestamp: timestamp,
         fileData: base64,
-        fileName: `chunk_${currentIndex}.webm`,
+        fileName: `chunk_${index}.webm`,
         userId: this.userId,
         scriptId: this.scriptId
       };
@@ -149,26 +173,26 @@ class VideoRecorder {
         this.uploadedChunks++;
         this.updateStatus(`已上传 ${this.uploadedChunks} 段`);
       } else {
-        throw new Error(result.message || '上传失败');
+        throw new Error(result.message || '服务器返回上传失败');
       }
     } catch (err) {
-      console.error(`第 ${currentIndex} 段上传错误:`, err);
+      console.error(`第 ${index} 段上传错误:`, err);
       // 缓存失败片段供 finalize 重试
-      this.chunks.push({
-        index: currentIndex,
-        blob,
-        timestamp: Date.now()
+      this.failedChunks.push({
+        index: index,
+        blob: blob,
+        timestamp: timestamp
       });
-      this.uploadedChunks++; // uploadedChunks 表示已处理的序号，无论成功与否
-      this.updateStatus(`第 ${currentIndex + 1} 段上传失败，将在结束时重试`);
+      this.updateStatus(`第 ${index + 1} 段上传失败: ${err.message}`);
     }
   }
 
+  // ========== 安全的 ArrayBuffer 转 Base64（分块避免栈溢出） ==========
   arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
-    let binary = '';
     const len = bytes.byteLength;
-    const chunkSize = 1024;
+    const chunkSize = 0x8000; // 32768，安全的单次处理长度
+    let binary = '';
     for (let i = 0; i < len; i += chunkSize) {
       const slice = bytes.subarray(i, i + chunkSize);
       binary += String.fromCharCode.apply(null, slice);
@@ -189,15 +213,15 @@ class VideoRecorder {
             const result = JSON.parse(xhr.responseText);
             resolve(result);
           } catch (err) {
-            reject(new Error('解析响应失败: ' + xhr.responseText.substring(0, 200)));
+            reject(new Error('解析响应失败(' + xhr.status + '): ' + xhr.responseText.substring(0, 200)));
           }
         } else {
-          reject(new Error('HTTP ' + xhr.status + ': ' + xhr.statusText));
+          reject(new Error('HTTP ' + xhr.status + ': ' + (xhr.statusText || '未知错误') + ' | 响应:' + xhr.responseText.substring(0, 200)));
         }
       };
 
-      xhr.onerror = () => reject(new Error('网络请求失败，请检查 CORS 或网络'));
-      xhr.ontimeout = () => reject(new Error('请求超时'));
+      xhr.onerror = () => reject(new Error('网络请求失败，请检查 CORS、HTTPS 或网络连接'));
+      xhr.ontimeout = () => reject(new Error('请求超时(30s)'));
 
       try {
         xhr.send(JSON.stringify(data));
@@ -233,17 +257,25 @@ class VideoRecorder {
     this.duration = Date.now() - this.startTime;
     this.updateStatus('正在处理，请稍候...');
 
-    // 停止摄像头预览（保留流直到 finalize 完成）
+    // 等待队列中的上传任务全部完成
+    if (this.isUploading) {
+      this.updateStatus('等待剩余片段上传...');
+      while (this.isUploading) {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    // 停止摄像头预览
     if (this.stream) {
       this.stream.getTracks().forEach(track => track.stop());
       this.stream = null;
     }
 
-    // 重试缓存的片段
-    if (this.chunks.length > 0) {
-      this.updateStatus(`正在重试 ${this.chunks.length} 个失败片段...`);
-      const retryChunks = [...this.chunks];
-      this.chunks = []; // 清空，重试失败的会再压入
+    // 重试失败的片段
+    if (this.failedChunks.length > 0) {
+      this.updateStatus(`正在重试 ${this.failedChunks.length} 个失败片段...`);
+      const retryChunks = [...this.failedChunks];
+      this.failedChunks = []; // 清空，重试失败的会再压入
 
       for (const chunk of retryChunks) {
         try {
@@ -264,17 +296,18 @@ class VideoRecorder {
 
           const result = await this.xhrPost(this.uploadUrl, body);
           if (!result.success) {
-            throw new Error(result.message);
+            throw new Error(result.message || '重试上传失败');
           }
+          this.uploadedChunks++;
         } catch (err) {
           console.error(`重试片段 ${chunk.index} 失败:`, err);
-          this.chunks.push(chunk); // 仍然失败，保留
+          this.failedChunks.push(chunk);
         }
       }
     }
 
-    if (this.chunks.length > 0) {
-      const msg = `${this.chunks.length} 个片段最终上传失败`;
+    if (this.failedChunks.length > 0) {
+      const msg = `${this.failedChunks.length} 个片段最终上传失败，无法合并`;
       this.updateStatus(msg);
       this.notifyMiniProgram('error', { message: msg });
       return;
@@ -286,7 +319,7 @@ class VideoRecorder {
       const mergeResult = await this.xhrPost(this.uploadUrl, {
         action: 'merge',
         taskId: this.taskId,
-        totalChunks: this.uploadedChunks,
+        totalChunks: this.nextChunkIndex, // 使用 nextChunkIndex（总段数）替代 uploadedChunks
         duration: this.duration
       });
 
@@ -297,7 +330,7 @@ class VideoRecorder {
       this.updateStatus('视频处理完成');
       document.getElementById('toggleBtn').textContent = '完成';
 
-      // 同时更新数据库状态（冗余保险）
+      // 冗余保险：直接更新数据库状态
       try {
         await this.xhrPost(this.uploadUrl, {
           action: 'updateRecord',
@@ -309,7 +342,6 @@ class VideoRecorder {
         });
       } catch (e) {
         console.error('updateRecord 失败:', e);
-        // merge 云函数内部也会更新，这里失败不影响主流程
       }
 
       this.notifyMiniProgram('complete', {
@@ -353,9 +385,6 @@ class VideoRecorder {
   notifyMiniProgram(action, data) {
     if (window.wx && wx.miniProgram) {
       wx.miniProgram.postMessage({ data: { action, ...data, timestamp: Date.now() } });
-      // 不再调用 navigateBack，让小程序侧通过轮询或 message 事件处理
-      // 如果小程序侧需要立即触发 message，可以延迟一小段时间后执行 redirectTo 等操作
-      // 但这里我们保持页面不动，让用户看到完成状态
     }
   }
 }
