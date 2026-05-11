@@ -25,13 +25,22 @@
       backdrop-filter: blur(10px);
     }
     .btn.recording { background: #ff4444; border-color: #ff6666; }
+    .btn:disabled { opacity: 0.5; }
     #status {
       position: fixed; top: 50px; left: 50%; transform: translateX(-50%);
       color: rgba(255,255,255,0.7); font-size: 12px; z-index: 10;
+      max-width: 80vw; text-align: center; word-break: break-all;
+    }
+    #back-btn {
+      position: fixed; top: 20px; left: 20px; z-index: 10;
+      background: rgba(0,0,0,0.4); color: #fff; border: none;
+      padding: 8px 16px; border-radius: 20px; font-size: 14px;
+      backdrop-filter: blur(10px);
     }
   </style>
 </head>
 <body>
+  <button id="back-btn">返回</button>
   <video id="preview" autoplay muted playsinline></video>
   <div id="timer">00:00</div>
   <div id="status">准备录制</div>
